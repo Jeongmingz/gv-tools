@@ -203,7 +203,7 @@ export default function Home() {
     }
   };
 
-  const handleDrop = (event: DragEvent<HTMLDivElement | HTMLElement>) => {
+  const handleDrop = (event: DragEvent<HTMLElement>) => {
     event.preventDefault();
     setIsDragging(false);
     setIsPageDragging(false);
@@ -291,7 +291,10 @@ export default function Home() {
               event.preventDefault();
               setIsDragging(false);
             }}
-            onDrop={handleDrop}
+            onDrop={(event) => {
+              event.stopPropagation();
+              handleDrop(event);
+            }}
             className={`flex cursor-pointer flex-col items-center gap-4 rounded-2xl border-2 border-dashed px-6 py-10 text-center outline-none transition ${
               isDragging ? "border-blue-500 bg-blue-50" : "border-slate-200 bg-white"
             } focus-visible:ring-2 focus-visible:ring-blue-500/70`}
