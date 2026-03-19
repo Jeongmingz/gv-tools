@@ -1,0 +1,33 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# testing
+automation
+/coverage
+
+# production
+/build
+/.next
+/out
+
+# misc
+.DS_Store
+*.pem
+.env.local
+.env.*.local
+.env
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# typescript
+*.tsbuildinfo
+
+# vercel
+.vercel
+
+# turbo
+.turbo
