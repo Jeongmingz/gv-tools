@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "GV Tools | PNG/JPG to WebP",
-  description: "Convert PNG or JPG files into lightweight WebP assets directly in your browser.",
+  title: "GV Tools",
+  description: "Browser-based internal utilities for file conversion and serial matching workflows.",
 };
 
 export default function RootLayout({
