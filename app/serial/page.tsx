@@ -5,14 +5,11 @@ import * as XLSX from "xlsx";
 import { STORE_DATA } from "@/lib/store-data";
 
 const BASE_REQUIRED_COLUMNS = ["시리얼", "품번", "수취인/주문예약일", "주소/주문매장코드", "매장코드"] as const;
-const DATA_REQUIRED_COLUMNS = [
-  "상품코드",
-  "주문자",
-  "수령자",
-  "배송지주소",
-  "판매처",
-  "주문번호",
-  "C/S 내역",
+const DATA_REQUIRED_COLUMNS = ["상품코드", "판매처", "주문번호"] as const;
+const DATA_REQUIRED_COLUMN_GROUPS = [
+  { label: "수령자 정보", columns: ["수령자", "수령자이름", "수취인", "받는분"] },
+  { label: "배송지 주소", columns: ["배송지주소", "수령자주소", "배송지 주소", "배송지", "주소"] },
+  { label: "시리얼 정보", columns: ["C/S 내역", "시리얼바코드", "시리얼번호", "시리얼", "CS내역"] },
 ] as const;
 type BaseRow = Record<string, unknown>;
 type DataRow = Record<string, unknown>;
@@ -90,10 +87,53 @@ function includesEitherWay(left: string, right: string) {
   return left.includes(right) || right.includes(left);
 }
 
+function matchesAddress(leftRaw: unknown, rightRaw: unknown) {
+  const leftFull = normalizeCompact(leftRaw);
+  const rightFull = normalizeCompact(rightRaw);
+  if (!leftFull || !rightFull) return false;
+  if (includesEitherWay(leftFull, rightFull)) return true;
+
+  const leftNoParen = normalizeCompact(String(leftRaw ?? "").replace(/\([^)]*\)/g, " "));
+  const rightNoParen = normalizeCompact(String(rightRaw ?? "").replace(/\([^)]*\)/g, " "));
+  if (leftNoParen && rightNoParen && includesEitherWay(leftNoParen, rightNoParen)) {
+    return true;
+  }
+
+  return false;
+}
+
 function extractSerial(detail: unknown) {
   const text = String(detail ?? "");
   const matched = text.match(/\[시리얼(?:번호|파일)\]\s*([^\s\]]+)/);
   return matched?.[1]?.trim() ?? "";
+}
+
+function firstValue(row: DataRow, columns: readonly string[]) {
+  for (const column of columns) {
+    const value = String(row[column] ?? "").trim();
+    if (value) return value;
+  }
+
+  return "";
+}
+
+function getCandidateSerial(row: DataRow) {
+  const barcode = firstValue(row, ["시리얼바코드", "시리얼번호", "시리얼"]);
+  return barcode || extractSerial(row["C/S 내역"] || row["CS내역"] || row["C/S"]);
+}
+
+function matchesRecipientAndAddress(row: BaseRow, candidate: DataRow) {
+  const recipientTokens = extractNameTokens(row["수취인/주문예약일"]);
+  const candidateOrderer = normalizeCompact(firstValue(candidate, ["주문자", "주문자이름", "구매자", "보내는분"]));
+  const candidateReceiver = normalizeCompact(firstValue(candidate, ["수령자", "수령자이름", "수취인", "받는분"]));
+  const candidateAddress = firstValue(candidate, ["배송지주소", "수령자주소", "배송지 주소", "배송지", "주소"]);
+
+  const recipientMatched = recipientTokens.some(
+    (token) => includesEitherWay(token, candidateOrderer) || includesEitherWay(token, candidateReceiver),
+  );
+  const addressMatched = matchesAddress(row["주소/주문매장코드"], candidateAddress);
+
+  return recipientMatched && addressMatched;
 }
 
 function extractNameTokens(value: unknown) {
@@ -155,15 +195,96 @@ function buildStoreProfile(code: string, name: string): StoreProfile {
   };
 }
 
+function trimRowKeys(row: Record<string, unknown>): Record<string, unknown> {
+  const trimmed: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(row)) {
+    trimmed[key.trim()] = val;
+  }
+  return trimmed;
+}
+
+function detectHtmlCharset(buffer: ArrayBuffer): string {
+  const rawPrefix = new TextDecoder("latin1").decode(buffer.slice(0, 4096)).toLowerCase();
+  const match = rawPrefix.match(/charset\s*=\s*['"]?\s*([a-z0-9_-]+)/i);
+  if (match?.[1]) {
+    const charset = match[1].toLowerCase();
+    if (
+      charset.includes("euc-kr") ||
+      charset.includes("cp949") ||
+      charset.includes("korean") ||
+      charset.includes("ks_c_5601")
+    ) {
+      return "euc-kr";
+    }
+  }
+  return "utf-8";
+}
+
+function decodeHtmlBuffer(buffer: ArrayBuffer): string {
+  const charset = detectHtmlCharset(buffer);
+  try {
+    return new TextDecoder(charset).decode(buffer);
+  } catch {
+    return new TextDecoder("utf-8").decode(buffer);
+  }
+}
+
+function isHtmlWorkbook(buffer: ArrayBuffer) {
+  const prefix = new TextDecoder("latin1").decode(buffer.slice(0, 8192)).trimStart().toLowerCase();
+  return (
+    (prefix.startsWith("<meta") || prefix.startsWith("<html") || prefix.startsWith("<!doctype html")) &&
+    prefix.includes("<table")
+  );
+}
+
+function readHtmlWorkbook(buffer: ArrayBuffer) {
+  const source = decodeHtmlBuffer(buffer);
+  const document = new DOMParser().parseFromString(source, "text/html");
+  const table = document.querySelector("table");
+
+  if (!table) {
+    throw new Error("HTML 형식의 엑셀 파일에서 표를 찾을 수 없습니다.");
+  }
+
+  const tableRows = Array.from(table.rows);
+  const headers = Array.from(tableRows[0]?.cells ?? [], (cell) => cell.textContent?.trim() ?? "");
+
+  if (headers.length === 0) {
+    throw new Error("HTML 형식의 엑셀 파일에서 헤더를 찾을 수 없습니다.");
+  }
+
+  const rows = tableRows.slice(1).map((tableRow) => {
+    const values = Array.from(tableRow.cells, (cell) => cell.textContent?.trim() ?? "");
+    const rowObj: Record<string, unknown> = {};
+    headers.forEach((header, index) => {
+      rowObj[header.trim()] = values[index] ?? "";
+    });
+    return rowObj;
+  });
+  const sheetName = "Worksheet";
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([headers]), sheetName);
+
+  return { workbook, sheetName, rows };
+}
+
 async function readWorkbook(file: File): Promise<ParsedWorkbook> {
   const buffer = await file.arrayBuffer();
+  if (isHtmlWorkbook(buffer)) {
+    return {
+      fileName: file.name,
+      ...readHtmlWorkbook(buffer),
+    };
+  }
+
   const workbook = XLSX.read(buffer, { type: "array", cellDates: true });
   const sheetName = workbook.SheetNames[0];
   const sheet = workbook.Sheets[sheetName];
-  const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, {
+  const rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, {
     defval: "",
     raw: false,
   });
+  const rows = rawRows.map(trimRowKeys);
 
   return {
     fileName: file.name,
@@ -186,6 +307,20 @@ function assertColumns(rows: Record<string, unknown>[], requiredColumns: readonl
   }
 }
 
+function assertDataColumns(rows: Record<string, unknown>[]) {
+  assertColumns(rows, DATA_REQUIRED_COLUMNS, "데이터");
+
+  const headers = Object.keys(rows[0] ?? {});
+  const missingGroups = DATA_REQUIRED_COLUMN_GROUPS.filter(
+    ({ columns }) => !columns.some((column) => headers.includes(column)),
+  );
+
+  if (missingGroups.length > 0) {
+    const missing = missingGroups.map(({ label, columns }) => `${label}(${columns.join(" 또는 ")})`);
+    throw new Error(`데이터 파일에 필요한 컬럼이 없습니다: ${missing.join(", ")}`);
+  }
+}
+
 function downloadWorkbook(workbook: XLSX.WorkBook, fileName: string) {
   const output = XLSX.write(workbook, { bookType: "xlsx", type: "array" });
   const blob = new Blob([output], {
@@ -204,27 +339,28 @@ function scoreCandidate(
   candidate: DataRow,
   storeProfile: StoreProfile | null,
 ): CandidateScore | null {
-  const serial = extractSerial(candidate["C/S 내역"]);
+  const serial = getCandidateSerial(candidate);
   if (!serial) return null;
 
   const recipientTokens = extractNameTokens(row["수취인/주문예약일"]);
-  const candidateOrderer = normalizeCompact(candidate["주문자"]);
-  const candidateReceiver = normalizeCompact(candidate["수령자"]);
-  const candidateAddress = normalizeCompact(candidate["배송지주소"]);
+  const candidateOrderer = normalizeCompact(firstValue(candidate, ["주문자", "주문자이름", "구매자", "보내는분"]));
+  const candidateReceiver = normalizeCompact(firstValue(candidate, ["수령자", "수령자이름", "수취인", "받는분"]));
+  const rawCandidateAddress = firstValue(candidate, ["배송지주소", "수령자주소", "배송지 주소", "배송지", "주소"]);
+  const candidateAddress = normalizeCompact(rawCandidateAddress);
   const candidateSeller = normalizeCompact(candidate["판매처"]);
   const candidateOrderNumber = normalizeCompact(candidate["주문번호"]);
 
   const recipientMatched = recipientTokens.some(
     (token) => includesEitherWay(token, candidateOrderer) || includesEitherWay(token, candidateReceiver),
   );
-  const addressMatched = includesEitherWay(normalizeCompact(row["주소/주문매장코드"]), candidateAddress);
+  const addressMatched = matchesAddress(row["주소/주문매장코드"], rawCandidateAddress);
 
   let storeSignalCount = 0;
 
   if (storeProfile) {
     const branchMatched =
       Boolean(storeProfile.branchCompact) &&
-      [candidateSeller, candidateOrderNumber, candidateOrderer, candidateAddress].some((value) =>
+      [candidateSeller, candidateOrderNumber, candidateOrderer, candidateReceiver, candidateAddress].some((value) =>
         value.includes(storeProfile.branchCompact),
       );
 
@@ -232,7 +368,7 @@ function scoreCandidate(
       Boolean(storeProfile.chainCompact) && candidateSeller.includes(storeProfile.chainCompact);
 
     const fullStoreMatched = storeProfile.aliases.some((alias) =>
-      [candidateSeller, candidateOrderNumber, candidateOrderer, candidateAddress].some((value) =>
+      [candidateSeller, candidateOrderNumber, candidateOrderer, candidateReceiver, candidateAddress].some((value) =>
         value.includes(alias),
       ),
     );
@@ -273,11 +409,12 @@ function processSerialFiles(
   dataFile: ParsedWorkbook,
 ): ProcessResult {
   assertColumns(baseFile.rows, BASE_REQUIRED_COLUMNS, "베이스");
-  assertColumns(dataFile.rows, DATA_REQUIRED_COLUMNS, "데이터");
+  assertDataColumns(dataFile.rows);
 
   const baseSheet = baseFile.workbook.Sheets[baseFile.sheetName];
   const dataRows = dataFile.rows as DataRow[];
   const groupedByCode = new Map<string, DataRow[]>();
+  const allRowsByCode = new Map<string, DataRow[]>();
   const usedRows = new WeakSet<DataRow>();
   const storesByCode = new Map<string, StoreProfile>();
 
@@ -287,9 +424,15 @@ function processSerialFiles(
 
   dataRows.forEach((row) => {
     const code = normalizeCode(row["상품코드"]);
-    const serial = extractSerial(row["C/S 내역"]);
+    const serial = getCandidateSerial(row);
 
-    if (!code || !serial) return;
+    if (!code) return;
+
+    const allRows = allRowsByCode.get(code) ?? [];
+    allRows.push(row);
+    allRowsByCode.set(code, allRows);
+
+    if (!serial) return;
 
     const group = groupedByCode.get(code) ?? [];
     group.push(row);
@@ -334,11 +477,17 @@ function processSerialFiles(
     }
 
     const candidates = (groupedByCode.get(productCode) ?? []).filter((candidate) => !usedRows.has(candidate));
+    const matchingRowsWithoutSerial = (allRowsByCode.get(productCode) ?? []).filter(
+      (candidate) => !getCandidateSerial(candidate) && matchesRecipientAndAddress(row, candidate),
+    );
 
     if (candidates.length === 0) {
       issues.push({
         rowNumber,
-        reason: "같은 상품코드의 시리얼 데이터가 없습니다.",
+        reason:
+          matchingRowsWithoutSerial.length > 0
+            ? "일치 주문을 찾았지만 원본의 시리얼바코드/C/S 내역이 비어 있습니다."
+            : "같은 상품코드의 시리얼 데이터가 없습니다.",
         productCode,
         recipient: recipientRaw,
         storeCode,
@@ -352,9 +501,12 @@ function processSerialFiles(
       .sort((left, right) => right.score - left.score);
 
     if (scoredCandidates.length === 0) {
-      const storeMessage = storeProfile
-        ? `매장(${storeProfile.name}) 포함 기준으로도 자동 확정할 수 없습니다.`
-        : "주문자/수령자/주소 기준으로 자동 확정할 수 없습니다.";
+      const storeMessage =
+        matchingRowsWithoutSerial.length > 0
+          ? "일치 주문을 찾았지만 원본의 시리얼바코드/C/S 내역이 비어 있습니다."
+          : storeProfile
+            ? `매장(${storeProfile.name}) 포함 기준으로도 자동 확정할 수 없습니다.`
+            : "주문자/수령자/주소 기준으로 자동 확정할 수 없습니다.";
 
       issues.push({
         rowNumber,
@@ -427,7 +579,7 @@ export default function SerialPage() {
           return;
         }
 
-        assertColumns(workbook.rows, DATA_REQUIRED_COLUMNS, "데이터");
+        assertDataColumns(workbook.rows);
         setDataWorkbook(workbook);
       } catch (err) {
         const message = err instanceof Error ? err.message : "엑셀 파일을 읽는 중 문제가 발생했습니다.";
@@ -504,9 +656,9 @@ export default function SerialPage() {
           <label className="flex min-h-52 cursor-pointer flex-col justify-between rounded-[1.75rem] border border-stone-200 bg-white p-6 shadow-sm transition hover:border-stone-300 hover:shadow-md">
             <div className="space-y-3">
               <p className="text-xs font-semibold uppercase tracking-[0.22em] text-sky-700">Serial Data</p>
-              <h2 className="text-2xl font-semibold text-stone-950">Serial_data.xls</h2>
+              <h2 className="text-2xl font-semibold text-stone-950">Serial_data.xls / 확장주문검색.xls</h2>
               <p className="text-sm leading-6 text-stone-600">
-                필수 컬럼: 상품코드, 주문자, 수령자, 배송지주소, 판매처, 주문번호, C/S 내역
+                기존 자료의 C/S 내역 및 신규 양식(수령자이름, 수령자주소, 시리얼바코드 등)을 모두 지원합니다.
               </p>
             </div>
             <div className="space-y-3">

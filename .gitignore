@@ -31,3 +31,7 @@ pnpm-debug.log*
 
 # turbo
 .turbo
+
+# examples / sample data
+example/
+
