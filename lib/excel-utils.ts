@@ -1,8 +1,11 @@
 import * as XLSX from "xlsx";
 
+// @ts-expect-error cpexcel module does not have dedicated type definitions
+import * as cptableModule from "xlsx/dist/cpexcel.full.mjs";
+
 export type DelimiterType = "," | "\t" | ";" | "|";
 
-export type EncodingType = "utf-8-bom" | "utf-8";
+export type EncodingType = "euc-kr" | "utf-8-bom" | "utf-8";
 
 export type SheetMetadata = {
   name: string;
@@ -121,6 +124,13 @@ export function convertSheetToCsvText(
  * Generates a downloadable CSV Blob from text and encoding option.
  */
 export function createCsvBlob(csvText: string, encoding: EncodingType): Blob {
+  if (encoding === "euc-kr") {
+    const encoded = cptableModule.utils.encode(949, csvText);
+    return new Blob([encoded], {
+      type: "text/csv;charset=euc-kr;",
+    });
+  }
+
   if (encoding === "utf-8-bom") {
     // 0xEF, 0xBB, 0xBF BOM for Excel UTF-8 recognition
     return new Blob(["\uFEFF", csvText], {
